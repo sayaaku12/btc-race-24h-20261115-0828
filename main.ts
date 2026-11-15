@@ -62,6 +62,25 @@ function rollingLow(n: number): number {
   return lo;
 }
 
+// Entry gate: deep drop + confirmed bounce, with trade budget and cooldown.
+// Same checks, same order as the inline version: budget, cooldown, enough
+// history, drop, then bounce. Returns true only when all of them pass.
+function shouldEnter(now: number, seq: number): boolean {
+  if (buys >= MAX_TRADES) return false;
+  if (seq - lastExitSeq < COOLDOWN_BARS) return false;
+  if (closes.length <= DROP_WINDOW) return false;
+  if (now / closes[closes.length - 1 - DROP_WINDOW] - 1 > -DROP_PCT) return false;
+  if (now / rollingLow(CONFIRM_WINDOW) - 1 < CONFIRM_PCT) return false;
+  return true;
+}
+
+// Exit gate: take profit, stop loss, or max hold, on value vs cost.
+// Same comparison as the inline version: return vs cost, in the same order.
+function shouldExit(value: bigint, cost: bigint, seq: number): boolean {
+  const ret = Number(value) / Number(cost) - 1;
+  return ret >= TAKE_PROFIT || ret <= -STOP_LOSS || seq - entrySeq >= MAX_HOLD_BARS;
+}
+
 await runBars({
   onBatch(state: BarsState, batch: Batch) {
     if (state.warmingUp) return [];
@@ -81,21 +100,17 @@ await runBars({
     if (held !== undefined && !prevHeld) entrySeq = state.seq;
     prevHeld = held !== undefined;
     if (held === undefined) {
-      // Entry: deep drop + confirmed bounce, with trade budget and cooldown.
-      if (buys >= MAX_TRADES) return [];
-      if (state.seq - lastExitSeq < COOLDOWN_BARS) return [];
-      if (closes.length <= DROP_WINDOW) return [];
+      // Entry: deep drop + confirmed bounce (see shouldEnter), then the
+      // min-notional check on cash before sending the whole-cash buy.
       const now = closes[closes.length - 1];
-      if (now / closes[closes.length - 1 - DROP_WINDOW] - 1 > -DROP_PCT) return [];
-      if (now / rollingLow(CONFIRM_WINDOW) - 1 < CONFIRM_PCT) return [];
+      if (!shouldEnter(now, state.seq)) return [];
       if (state.cash < BigInt(state.hello.fees.min_notional_quote_units)) return [];
       return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: state.cash, max_slippage_bps: MAX_SLIPPAGE_BPS }];
     }
 
-    // Exit: take profit, stop loss, or max hold, on value vs cost.
+    // Exit: take profit, stop loss, or max hold (see shouldExit).
     const value = state.value(SYMBOL, held.qty);
-    const ret = Number(value) / Number(held.cost) - 1;
-    if (ret >= TAKE_PROFIT || ret <= -STOP_LOSS || state.seq - entrySeq >= MAX_HOLD_BARS) {
+    if (shouldExit(value, held.cost, state.seq)) {
       return [{ side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
     }
     return [];
